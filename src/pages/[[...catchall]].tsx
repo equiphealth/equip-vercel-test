@@ -9,16 +9,27 @@ import {GetStaticPaths, GetStaticProps} from 'next';
 import Error from 'next/error';
 import {useRouter} from 'next/router';
 import {PLASMIC} from '@/plasmic-init';
+import {generateAllPaths, getActiveVariation, rewriteWithoutTraits,} from "@plasmicapp/loader-nextjs/edge"
 
 /**
  * Use fetchPages() to fetch list of pages that have been created in Plasmic
  */
 export const getStaticPaths: GetStaticPaths = async () => {
-	const pages = await PLASMIC.fetchPages();
+	const pageModules = (await PLASMIC.fetchPages()).filter(
+		p => !p.path.includes("/partners")
+	)
+	const paths = pageModules.flatMap(page =>
+		generateAllPaths(page.path).map(path => ({
+			params: {
+				catchall: path.substring(1).split("/"),
+			},
+		}))
+	)
+
 	return {
-		paths: pages.map((page) => ({
-			params: { catchall: page.path.substring(1).split('/') }
-		})),
+		paths: [
+			...paths,
+		],
 		fallback: 'blocking'
 	};
 };
@@ -27,49 +38,61 @@ export const getStaticPaths: GetStaticPaths = async () => {
  * For each page, pre-fetch the data we need to render it
  */
 export const getStaticProps: GetStaticProps = async (context) => {
-	const { catchall } = context.params ?? {};
+	const { catchall } = context.params ?? {}
+	const plasmicPath = `/${(catchall as string[])?.join("/") ?? ""}`
 
-	// Convert the catchall param into a path string
-	const plasmicPath =
-		typeof catchall === 'string' ? catchall : Array.isArray(catchall) ? `/${catchall.join('/')}` : '/';
-	const plasmicData = await PLASMIC.maybeFetchComponentData(plasmicPath);
-	if (!plasmicData) {
-		// This is some non-Plasmic catch-all page
-		return {
-			props: {}
-		};
+	const { path, traits } = rewriteWithoutTraits(plasmicPath)
+
+	const plasmicData = await PLASMIC.maybeFetchComponentData(
+		path
+	)
+
+	const variation = getActiveVariation({
+		splits: PLASMIC.getActiveSplits(),
+		traits,
+		path: plasmicPath
+	});
+
+	const externalIds = PLASMIC.getExternalVariation(variation)
+	const pageMeta = plasmicData?.entryCompMetas?.[0]
+
+	if (!pageMeta) {
+		return { props: {}, notFound: true }
 	}
 
-	// This is a path that Plasmic knows about.
-	const pageMeta = plasmicData.entryCompMetas[0];
-
-	// Cache the necessary data fetched for the page.
+	// Cache any component-level usePlasmicQuery() data
+	// that we need to render this page
 	const queryCache = await extractPlasmicQueryData(
 		<PlasmicRootProvider
 			loader={PLASMIC}
 			prefetchedData={plasmicData}
-			pageRoute={pageMeta.path}
 			pageParams={pageMeta.params}
+			skipCss
+			skipFonts
+			variation={variation}
 		>
 			<PlasmicComponent component={pageMeta.displayName} />
 		</PlasmicRootProvider>
-	);
+	)
 
-	// Pass the data in as props.
 	return {
-		props: { plasmicData, queryCache },
-
-		// Using incremental static regeneration, will invalidate this page
-		// after 300s (no deploy webhooks needed)
-		revalidate: 300
-	};
+		props: {
+			plasmicData,
+			queryCache,
+			pageMeta,
+			variation,
+			externalIds,
+			traits,
+		},
+		revalidate: 3600, // keep cache for an hour
+	}
 };
 
 /**
  * Actually render the page!
  */
-export default function CatchallPage(props: { plasmicData?: ComponentRenderData; queryCache?: Record<string, any> }) {
-	const { plasmicData, queryCache } = props;
+export default function CatchallPage(props: { plasmicData?: ComponentRenderData; queryCache?: Record<string, any>, variation?: any }) {
+	const { plasmicData, queryCache, variation } = props;
 	const router = useRouter();
 	if (!plasmicData || plasmicData.entryCompMetas.length === 0) {
 		return <Error statusCode={404} />;
@@ -84,6 +107,7 @@ export default function CatchallPage(props: { plasmicData?: ComponentRenderData;
 			pageRoute={pageMeta.path}
 			pageParams={pageMeta.params}
 			pageQuery={router.query}
+			variation={variation}
 		>
 			{
 				// pageMeta.displayName contains the name of the component you fetched.
